@@ -1,4 +1,4 @@
-# updated 7/30/2026: require at least three SNVs per missense encoding
+# updated 7/30/2026: require at least three SNVs per amino-acid change; support '*' stop codons
 from concurrent.futures import ProcessPoolExecutor
 import copy
 import re
@@ -20,18 +20,21 @@ codon_dicts = {
     'I': 'ATT', 'M': 'ATG', 'N': 'AAT', 'K': 'AAG', 'V': 'GTG',
     'D': 'GAT', 'E': 'GAG', 'S': 'TCT', 'C': 'TGT', 'W': 'TGG',
     'P': 'CCT', 'R': 'CGG', 'T': 'ACT', 'A': 'GCT', 'G': 'GGG',
+    '*': 'TGA',
     },
     'ecoli': {
         'F': 'TTT', 'L': 'CTG', 'Y': 'TAT', 'H': 'CAT', 'Q': 'CAG',
         'I': 'ATT', 'M': 'ATG', 'N': 'AAC', 'K': 'AAA', 'V': 'GTG',
         'D': 'GAT', 'E': 'GAA', 'S': 'TCT', 'C': 'TGC', 'W': 'TGG',
         'P': 'CCG', 'R': 'CGT', 'T': 'ACC', 'A': 'GCG', 'G': 'GGC',
+        '*': 'TAA',
     },
     'yeast': {
         'F': 'TTT', 'L': 'CTA', 'Y': 'TAT', 'H': 'CAT', 'Q': 'CAA',
         'I': 'ATT', 'M': 'ATG', 'N': 'AAT', 'K': 'AAA', 'V': 'GTT',
         'D': 'GAT', 'E': 'GAA', 'S': 'TCT', 'C': 'TGT', 'W': 'TGG',
         'P': 'CCA', 'R': 'AGA', 'T': 'ACT', 'A': 'GCT', 'G': 'GGT',
+        '*': 'TAA',
     }
 }
 class MultiAssemblyDesigner:
@@ -47,7 +50,7 @@ class MultiAssemblyDesigner:
         tm (float): Target melting temperature.
         output (str): Type of output, 'design' or 'update'.
         min_snvs_per_mutation (int): Minimum nucleotide substitutions used to
-            encode each missense mutation. If the missense codon cannot provide
+            encode each amino-acid substitution, including nonsense mutations. If the missense codon cannot provide
             enough substitutions, nearby synonymous marker substitutions are added.
         silent_marker_radius_codons (int): Maximum distance from the missense
             codon to search for synonymous marker codons.
@@ -101,7 +104,7 @@ class MultiAssemblyDesigner:
         return sorted(mutations, key=lambda x: int(''.join(filter(str.isdigit, x))))
 
     def _process_mutations(self):
-        """Resolve each missense change into its complete nucleotide edit block."""
+        """Resolve each amino-acid change into its complete nucleotide edit block."""
         self.data[[
             'Positions',
             'Reference_bases',
@@ -144,6 +147,9 @@ class MultiAssemblyDesigner:
         standard = CodonTable.unambiguous_dna_by_name['Standard']
         for codon, aa in standard.forward_table.items():
             codons_by_aa.setdefault(aa, []).append(codon)
+        # Biopython's forward_table excludes termination codons, so add them
+        # explicitly. This permits mutation names such as Q123*.
+        codons_by_aa['*'] = list(standard.stop_codons)
         return {aa: sorted(codons) for aa, codons in codons_by_aa.items()}
 
     @staticmethod
@@ -157,7 +163,15 @@ class MultiAssemblyDesigner:
         )
 
     def _choose_missense_codon(self, wt_codon, target_aa):
-        """Choose a target codon with maximal separation from the WT codon."""
+        """Choose a target codon with maximal separation from the WT codon.
+
+        The target amino acid may be '*' to encode a termination codon.
+        """
+        if target_aa not in self.codons_by_aa:
+            raise ValueError(
+                f"Unsupported target amino-acid symbol {target_aa!r}; "
+                "use a standard one-letter code or '*' for stop."
+            )
         preferred = self.codon_dict[target_aa]
         if self._snv_distance(wt_codon, preferred) >= self.min_snvs_per_mutation:
             return preferred
@@ -256,7 +270,7 @@ class MultiAssemblyDesigner:
                 'position': full_sequence_position,
                 'reference': old_codon,
                 'alternate': new_codon,
-                'kind': 'missense',
+                'kind': 'nonsense' if mut[-1] == '*' else 'missense',
             }]
             snv_count = self._snv_distance(old_codon, new_codon)
 
@@ -355,7 +369,7 @@ class MultiAssemblyDesigner:
         return edited_seq
 
     def _design_oligo_pipeline(self, row):
-        """Design one or more oligos for a row of missense mutations."""
+        """Design one or more oligos for a row of amino-acid changes."""
         pos_start_ls = []
         pos_end_ls = []
         for edit_block in row['Nucleotide_edits']:
@@ -416,7 +430,7 @@ class MultiAssemblyDesigner:
         )
 
     def _design_mutant_oligo(self, seq, edit_block, result='oligo'):
-        """Design an oligo containing a missense edit and its silent markers."""
+        """Design an oligo containing a coding edit and its silent markers."""
         edits = self._flatten_edits([edit_block])
         mut_seq = self._apply_edits(seq, edits)
         wt_seq = Seq(str(seq))
@@ -474,7 +488,7 @@ class MultiAssemblyDesigner:
         index_i,
         index_f,
     ):
-        """Return a merged oligo for overlapping missense edit blocks."""
+        """Return a merged oligo for overlapping coding-edit blocks."""
         edits = self._flatten_edits(edit_blocks[index_i:index_f + 1])
         edited_seq = self._apply_edits(seq, edits)
         mod_start = int(start) - 1
@@ -569,7 +583,7 @@ class MultiAssemblyDesigner:
         return df
 
     def _export_encoding_map(self):
-        """Export the expected nucleotide barcode for every missense change."""
+        """Export the expected nucleotide barcode for every amino-acid change."""
         records = []
         for _, row in self.data.iterrows():
             variant = '/'.join(row['aa_mut'])
